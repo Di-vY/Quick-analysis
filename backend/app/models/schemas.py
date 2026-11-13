@@ -26,13 +26,16 @@ class DatasetSummary(BaseModel):
     loaded_tables: list[TableMetadata] = Field(default_factory=list)
 
 class ChatMessage(BaseModel):
-    role: str # "user" or "assistant"
-    content: str
+    role: str = Field(pattern=r"^(user|assistant)$")
+    content: str = Field(max_length=20_000)
 
 class ChatRequest(BaseModel):
-    dataset_id: str
-    message: str
-    history: list[ChatMessage] = Field(default_factory=list)
+    dataset_id: str = Field(max_length=200)
+    message: str = Field(min_length=1, max_length=2_000)
+    history: list[ChatMessage] = Field(default_factory=list, max_length=20)
+
+class SqlQueryRequest(BaseModel):
+    sql: str = Field(min_length=1, max_length=10_000)
 
 class ChartSpec(BaseModel):
     chart_type: str = "none" # "bar", "line", "scatter", "pie", "histogram", "none"

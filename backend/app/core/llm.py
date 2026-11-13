@@ -58,9 +58,10 @@ class LLMAnalystEngine:
 
         with httpx.Client(timeout=6.0) as http_client:
             for model_name in models_to_try[:3]:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+                # Key goes in a header, never the URL, so it cannot leak into request logs.
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
                 try:
-                    resp = http_client.post(url, json=payload)
+                    resp = http_client.post(url, json=payload, headers={"x-goog-api-key": api_key})
                     if resp.status_code == 200:
                         data = resp.json()
                         candidates = data.get("candidates", [])
@@ -161,9 +162,16 @@ class LLMAnalystEngine:
                 suggestions=self.generate_starter_questions(summary),
             )
 
-        # Build multi-table schema context
+        # Build multi-table schema context (untrusted, user-uploaded content)
         schema_context = dataset_manager.get_all_tables_schema_context()
-        sample_rows_json = json.dumps(summary.preview_rows[:3], default=str, indent=2)
+        safe_preview = [
+            {
+                str(k)[:80]: (v[:100] + "…" if isinstance(v, str) and len(v) > 100 else v)
+                for k, v in row.items()
+            }
+            for row in summary.preview_rows[:3]
+        ]
+        sample_rows_json = json.dumps(safe_preview, default=str, indent=2)
 
         system_instruction = SYSTEM_ANALYST_PROMPT.format(
             schema_context=schema_context, sample_rows=sample_rows_json

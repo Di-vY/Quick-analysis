@@ -3,6 +3,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { Play, Download, Terminal, Database, Clock, Sparkles, GitMerge } from 'lucide-react';
 import { DatasetSummary } from '@/types';
+import { getAuthHeaders } from '@/lib/api';
 
 interface SqlWorkspaceViewProps {
   dataset: DatasetSummary | null;
@@ -128,7 +129,10 @@ export const SqlWorkspaceView: React.FC<SqlWorkspaceViewProps> = ({ dataset, the
       const apiBase = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
       const res = await fetch(`${apiBase}/api/query/sql`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaders(),
+        },
         body: JSON.stringify({ sql }),
       });
 

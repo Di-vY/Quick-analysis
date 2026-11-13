@@ -1,6 +1,13 @@
 import { DatasetSummary, ChatResponse } from '@/types';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+export const ACCESS_KEY_STORAGE_KEY = 'app-access-key';
+
+export function getAuthHeaders(): Record<string, string> {
+  if (typeof window === 'undefined') return {};
+  const key = localStorage.getItem(ACCESS_KEY_STORAGE_KEY)?.trim();
+  return key ? { 'X-API-Key': key } : {};
+}
 
 export async function uploadDataset(file: File): Promise<DatasetSummary> {
   const formData = new FormData();
@@ -8,6 +15,7 @@ export async function uploadDataset(file: File): Promise<DatasetSummary> {
 
   const res = await fetch(`${API_BASE_URL}/api/upload`, {
     method: 'POST',
+    headers: getAuthHeaders(),
     body: formData,
   });
 
@@ -20,7 +28,9 @@ export async function uploadDataset(file: File): Promise<DatasetSummary> {
 }
 
 export async function getCurrentDataset(): Promise<DatasetSummary> {
-  const res = await fetch(`${API_BASE_URL}/api/dataset/current`);
+  const res = await fetch(`${API_BASE_URL}/api/dataset/current`, {
+    headers: getAuthHeaders(),
+  });
   if (!res.ok) {
     throw new Error('No dataset currently loaded');
   }
@@ -30,6 +40,7 @@ export async function getCurrentDataset(): Promise<DatasetSummary> {
 export async function activateTable(tableName: string): Promise<DatasetSummary> {
   const res = await fetch(`${API_BASE_URL}/api/tables/${encodeURIComponent(tableName)}/activate`, {
     method: 'POST',
+    headers: getAuthHeaders(),
   });
   if (!res.ok) {
     const errorData = await res.json().catch(() => ({}));
@@ -41,6 +52,7 @@ export async function activateTable(tableName: string): Promise<DatasetSummary> 
 export async function deleteTable(tableName: string): Promise<DatasetSummary | null> {
   const res = await fetch(`${API_BASE_URL}/api/tables/${encodeURIComponent(tableName)}`, {
     method: 'DELETE',
+    headers: getAuthHeaders(),
   });
   if (!res.ok) {
     const errorData = await res.json().catch(() => ({}));
@@ -59,6 +71,7 @@ export async function sendChatMessage(
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
+      ...getAuthHeaders(),
     },
     body: JSON.stringify({
       dataset_id: datasetId,

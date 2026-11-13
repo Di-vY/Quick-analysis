@@ -1,27 +1,50 @@
 import re
+import threading
 from pathlib import Path
 from typing import Any, Tuple, Optional
 import duckdb
 import pandas as pd
+from app.config import settings, UPLOAD_DIR
+from app.core.security import validate_read_only_sql
 from app.models.schemas import ColumnInfo, DatasetSummary, TableMetadata
+
+_MAX_SAMPLE_CHARS = 80
 
 
 class DatasetManager:
     """Manages multiple DuckDB in-memory tables, file ingestion, and relational schema profiling."""
 
     def __init__(self):
-        # Persistent in-memory DuckDB connection supporting multiple tables and SQL JOINs
-        self.con = duckdb.connect(database=":memory:")
+        self.con = self._create_locked_connection()
+        self._lock = threading.RLock()
         self.active_dataset_id: str | None = None
         self.active_table_name: str | None = None
         self.active_filename: str | None = None
-        # Store loaded tables by table_name -> {"filename": str, "columns": list[ColumnInfo], "row_count": int, "preview_rows": list}
+        # table_name -> {"filename", "columns", "row_count", "preview_rows"}
         self.tables: dict[str, dict[str, Any]] = {}
+
+    @staticmethod
+    def _create_locked_connection() -> duckdb.DuckDBPyConnection:
+        """In-memory DuckDB with filesystem access restricted to UPLOAD_DIR and settings locked."""
+        con = duckdb.connect(
+            database=":memory:",
+            config={
+                "autoinstall_known_extensions": False,
+                "autoload_known_extensions": False,
+                "memory_limit": settings.DUCKDB_MEMORY_LIMIT,
+                "threads": settings.DUCKDB_THREADS,
+            },
+        )
+        upload_dir_sql = UPLOAD_DIR.as_posix().replace("'", "''")
+        con.execute(f"SET allowed_directories = ['{upload_dir_sql}']")
+        con.execute("SET enable_external_access = false")
+        con.execute("SET lock_configuration = true")
+        return con
 
     def _sanitize_table_name(self, filename: str) -> str:
         stem = Path(filename).stem.lower()
         clean = re.sub(r"[^a-z0-9_]", "_", stem)
-        clean = re.sub(r"_+", "_", clean).strip("_")
+        clean = re.sub(r"_+", "_", clean).strip("_")[:60]
         if not clean or clean[0].isdigit():
             clean = f"tbl_{clean}" if clean else "dataset_tbl"
         if clean == "data_table":
@@ -30,35 +53,47 @@ class DatasetManager:
 
     def load_file(self, file_path: Path, filename: str) -> DatasetSummary:
         resolved_path = file_path.resolve()
+        if UPLOAD_DIR not in resolved_path.parents:
+            raise ValueError("File must be located inside the uploads directory.")
+
         ext = resolved_path.suffix.lower()
         table_name = self._sanitize_table_name(filename)
-
-        if ext == ".csv":
-            self.con.execute(
-                f'CREATE OR REPLACE TABLE "{table_name}" AS SELECT * FROM read_csv_auto(\'{resolved_path.as_posix()}\', all_varchar=false);'
-            )
-        elif ext in [".xlsx", ".xls"]:
-            df = pd.read_excel(resolved_path)
-            self.con.register(f"__tmp_{table_name}", df)
-            self.con.execute(
-                f'CREATE OR REPLACE TABLE "{table_name}" AS SELECT * FROM "__tmp_{table_name}";'
-            )
-            self.con.unregister(f"__tmp_{table_name}")
-        elif ext == ".parquet":
-            self.con.execute(
-                f'CREATE OR REPLACE TABLE "{table_name}" AS SELECT * FROM read_parquet(\'{resolved_path.as_posix()}\');'
-            )
-        else:
+        if table_name not in self.tables and len(self.tables) >= settings.MAX_TABLES:
             raise ValueError(
-                f"Unsupported file format: {ext}. Please upload a CSV, Excel (.xlsx/.xls), or Parquet file."
+                f"Table limit reached ({settings.MAX_TABLES}). Remove a table before uploading another."
             )
 
-        # Profile this newly created table
-        profile = self._profile_table(table_name, filename)
-        self.tables[table_name] = profile
+        path_sql = resolved_path.as_posix().replace("'", "''")
+        with self._lock:
+            if ext == ".csv":
+                self.con.execute(
+                    f"CREATE OR REPLACE TABLE \"{table_name}\" AS SELECT * FROM read_csv_auto('{path_sql}');"
+                )
+            elif ext in [".xlsx", ".xls"]:
+                df = pd.read_excel(resolved_path)
+                tmp_name = f"__tmp_{table_name}"
+                self.con.register(tmp_name, df)
+                try:
+                    self.con.execute(f'CREATE OR REPLACE TABLE "{table_name}" AS SELECT * FROM "{tmp_name}";')
+                finally:
+                    self.con.unregister(tmp_name)
+            elif ext == ".parquet":
+                self.con.execute(
+                    f"CREATE OR REPLACE TABLE \"{table_name}\" AS SELECT * FROM read_parquet('{path_sql}');"
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported file format: {ext}. Please upload a CSV, Excel (.xlsx/.xls), or Parquet file."
+                )
 
-        # Activate this table and sync `data_table` view alias
-        return self.activate_table(table_name)
+            self.tables[table_name] = self._profile_table(table_name, filename)
+            return self.activate_table(table_name)
+
+    @staticmethod
+    def _truncate_sample(value: Any) -> Any:
+        if isinstance(value, str) and len(value) > _MAX_SAMPLE_CHARS:
+            return value[:_MAX_SAMPLE_CHARS] + "…"
+        return value
 
     def _profile_table(self, table_name: str, filename: str) -> dict[str, Any]:
         count_res = self.con.execute(f'SELECT COUNT(*) FROM "{table_name}";').fetchone()
@@ -70,18 +105,19 @@ class DatasetManager:
         for row in describe_res:
             col_name = str(row[0])
             col_type = str(row[1])
+            quoted = col_name.replace('"', '""')
 
             try:
                 samples = self.con.execute(
-                    f'SELECT DISTINCT "{col_name}" FROM "{table_name}" WHERE "{col_name}" IS NOT NULL LIMIT 3;'
+                    f'SELECT DISTINCT "{quoted}" FROM "{table_name}" WHERE "{quoted}" IS NOT NULL LIMIT 3;'
                 ).fetchall()
-                sample_vals = [s[0] for s in samples]
+                sample_vals = [self._truncate_sample(s[0]) for s in samples]
             except Exception:
                 sample_vals = []
 
             try:
                 nulls = self.con.execute(
-                    f'SELECT COUNT(*) FROM "{table_name}" WHERE "{col_name}" IS NULL;'
+                    f'SELECT COUNT(*) FROM "{table_name}" WHERE "{quoted}" IS NULL;'
                 ).fetchone()
                 null_count = nulls[0] if nulls else 0
             except Exception:
@@ -108,53 +144,52 @@ class DatasetManager:
         }
 
     def activate_table(self, table_name: str) -> DatasetSummary:
-        if table_name not in self.tables:
-            raise ValueError(f"Table '{table_name}' is not loaded.")
+        with self._lock:
+            if table_name not in self.tables:
+                raise ValueError(f"Table '{table_name}' is not loaded.")
 
-        self.active_table_name = table_name
-        self.active_dataset_id = table_name
-        self.active_filename = self.tables[table_name]["filename"]
+            self.active_table_name = table_name
+            self.active_dataset_id = table_name
+            self.active_filename = self.tables[table_name]["filename"]
 
-        # Point `data_table` alias view to the active table so single-table queries work transparently
-        self.con.execute("DROP VIEW IF EXISTS data_table;")
-        self.con.execute(f'CREATE OR REPLACE VIEW data_table AS SELECT * FROM "{table_name}";')
+            # Point `data_table` alias view to the active table so single-table queries work transparently
+            self.con.execute("DROP VIEW IF EXISTS data_table;")
+            self.con.execute(f'CREATE OR REPLACE VIEW data_table AS SELECT * FROM "{table_name}";')
 
-        return self.get_summary()
+            return self.get_summary()
 
     def remove_table(self, table_name: str) -> Optional[DatasetSummary]:
-        if table_name not in self.tables:
-            raise ValueError(f"Table '{table_name}' does not exist.")
+        with self._lock:
+            if table_name not in self.tables:
+                raise ValueError(f"Table '{table_name}' does not exist.")
 
-        del self.tables[table_name]
-        try:
-            self.con.execute("DROP VIEW IF EXISTS data_table;")
-            self.con.execute(f'DROP TABLE IF EXISTS "{table_name}";')
-        except Exception:
-            pass
+            del self.tables[table_name]
+            try:
+                self.con.execute("DROP VIEW IF EXISTS data_table;")
+                self.con.execute(f'DROP TABLE IF EXISTS "{table_name}";')
+            except Exception:
+                pass
 
-        if len(self.tables) == 0:
-            self.active_table_name = None
-            self.active_dataset_id = None
-            self.active_filename = None
-            return None
+            if len(self.tables) == 0:
+                self.active_table_name = None
+                self.active_dataset_id = None
+                self.active_filename = None
+                return None
 
-        # Switch active table to most recently remaining table
-        next_table = list(self.tables.keys())[-1]
-        return self.activate_table(next_table)
+            next_table = list(self.tables.keys())[-1]
+            return self.activate_table(next_table)
 
     def get_loaded_tables_metadata(self) -> list[TableMetadata]:
-        meta_list: list[TableMetadata] = []
-        for t_name, info in self.tables.items():
-            meta_list.append(
-                TableMetadata(
-                    table_name=t_name,
-                    filename=info["filename"],
-                    row_count=info["row_count"],
-                    column_count=len(info["columns"]),
-                    columns=[c.name for c in info["columns"]],
-                )
+        return [
+            TableMetadata(
+                table_name=t_name,
+                filename=info["filename"],
+                row_count=info["row_count"],
+                column_count=len(info["columns"]),
+                columns=[c.name for c in info["columns"]],
             )
-        return meta_list
+            for t_name, info in self.tables.items()
+        ]
 
     def find_joinable_columns(self) -> list[dict[str, str]]:
         """Finds matching column names across pairs of loaded tables for SQL JOINs."""
@@ -169,8 +204,7 @@ class DatasetManager:
                 t2 = table_names[j]
                 cols1 = {c.name.lower(): c.name for c in self.tables[t1]["columns"]}
                 cols2 = {c.name.lower(): c.name for c in self.tables[t2]["columns"]}
-                shared = set(cols1.keys()).intersection(set(cols2.keys()))
-                for key_lower in shared:
+                for key_lower in set(cols1) & set(cols2):
                     joins.append(
                         {
                             "left_table": t1,
@@ -182,7 +216,7 @@ class DatasetManager:
         return joins
 
     def get_all_tables_schema_context(self) -> str:
-        """Builds a comprehensive schema description of all loaded tables and join keys for the LLM."""
+        """Builds a schema description of all loaded tables and join keys for the LLM."""
         if not self.tables:
             return "No tables loaded."
 
@@ -225,13 +259,25 @@ class DatasetManager:
         )
 
     def execute_query(self, query: str, limit: int = 500) -> Tuple[list[dict[str, Any]], list[str]]:
-        """Executes a SQL query against DuckDB and returns (records, column_names)."""
-        clean_query = query.strip().rstrip(";")
-        wrapped_query = f"SELECT * FROM ({clean_query}) LIMIT {limit};"
+        """Validates and executes a read-only SQL query with a row cap and timeout."""
+        clean_query = validate_read_only_sql(query)
+        # Newlines keep a trailing `--` comment from swallowing the wrapper.
+        wrapped_query = f"SELECT * FROM (\n{clean_query}\n) AS q LIMIT {int(limit)};"
 
-        rel = self.con.execute(wrapped_query)
-        col_names = [desc[0] for desc in rel.description]
-        df = rel.df()
+        with self._lock:
+            timer = threading.Timer(settings.QUERY_TIMEOUT_SECONDS, self.con.interrupt)
+            timer.start()
+            try:
+                rel = self.con.execute(wrapped_query)
+                col_names = [desc[0] for desc in rel.description]
+                df = rel.df()
+            except duckdb.InterruptException as exc:
+                raise TimeoutError(
+                    f"Query exceeded the {settings.QUERY_TIMEOUT_SECONDS:g}s time limit and was cancelled."
+                ) from exc
+            finally:
+                timer.cancel()
+
         records = df.to_dict(orient="records")
         return self._clean_records(records), col_names
 
@@ -240,7 +286,7 @@ class DatasetManager:
         for row in records:
             cleaned_row = {}
             for k, v in row.items():
-                if pd.isna(v):
+                if pd.api.types.is_scalar(v) and pd.isna(v):
                     cleaned_row[k] = None
                 elif hasattr(v, "isoformat"):
                     cleaned_row[k] = v.isoformat()

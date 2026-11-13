@@ -1,7 +1,8 @@
 'use client';
 
-import React from 'react';
-import { Settings as SettingsIcon, Sun, Moon, Cpu, Server, Database, Trash2, CheckCircle2 } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { Settings as SettingsIcon, Sun, Moon, Cpu, Server, Database, Trash2, KeyRound, Check } from 'lucide-react';
+import { ACCESS_KEY_STORAGE_KEY } from '@/lib/api';
 
 interface SettingsViewProps {
   theme: 'light' | 'dark';
@@ -16,15 +17,35 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   backendOnline,
   onClearSession,
 }) => {
+  const [accessKey, setAccessKey] = useState('');
+  const [savedNotice, setSavedNotice] = useState(false);
+
+  useEffect(() => {
+    const stored = localStorage.getItem(ACCESS_KEY_STORAGE_KEY) || '';
+    setAccessKey(stored);
+  }, []);
+
+  const handleSaveKey = (e: React.FormEvent) => {
+    e.preventDefault();
+    const trimmed = accessKey.trim();
+    if (trimmed) {
+      localStorage.setItem(ACCESS_KEY_STORAGE_KEY, trimmed);
+    } else {
+      localStorage.removeItem(ACCESS_KEY_STORAGE_KEY);
+    }
+    setSavedNotice(true);
+    setTimeout(() => setSavedNotice(false), 2000);
+  };
+
   return (
-    <div className="flex-1 flex flex-col h-full overflow-hidden p-6 max-w-3xl space-y-6">
+    <div className="flex-1 flex flex-col h-full overflow-y-auto p-6 max-w-3xl space-y-6">
       <div className="border-b border-slate-200 dark:border-slate-800 pb-3">
         <h3 className={`text-base font-bold flex items-center gap-2 ${theme === 'light' ? 'text-slate-900' : 'text-white'}`}>
           <SettingsIcon className="w-5 h-5 text-blue-500" />
           <span>System Settings & Configuration</span>
         </h3>
         <p className="text-xs text-slate-500">
-          Manage interface appearance, AI model configurations, and backend status.
+          Manage interface appearance, API access authentication, AI model configurations, and backend status.
         </p>
       </div>
 
@@ -70,6 +91,49 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
         </div>
 
+        {/* API Access Key Card */}
+        <div
+          className={`p-5 rounded-2xl border ${
+            theme === 'light' ? 'bg-white border-slate-200 shadow-sm' : 'bg-[#0b142c] border-slate-800'
+          }`}
+        >
+          <h4 className={`text-xs font-bold uppercase tracking-wider ${theme === 'light' ? 'text-slate-500' : 'text-slate-400'}`}>
+            API Access Authentication
+          </h4>
+          <p className="text-[11px] text-slate-400 mt-1">
+            When <code className="font-mono text-blue-500">APP_ACCESS_KEY</code> is configured on the FastAPI server, enter the key here so requests include the <code className="font-mono text-blue-500">X-API-Key</code> header.
+          </p>
+          <form onSubmit={handleSaveKey} className="mt-3 flex items-center gap-2">
+            <div className="relative flex-1">
+              <KeyRound className="w-3.5 h-3.5 absolute left-3 top-2.5 text-slate-400" />
+              <input
+                type="password"
+                value={accessKey}
+                onChange={(e) => setAccessKey(e.target.value)}
+                placeholder="Enter backend access key (optional locally)..."
+                className={`w-full pl-9 pr-3 py-1.5 rounded-xl border text-xs font-mono focus:outline-none focus:border-blue-500 ${
+                  theme === 'light'
+                    ? 'bg-slate-50 border-slate-300 text-slate-900'
+                    : 'bg-slate-900 border-slate-700 text-white'
+                }`}
+              />
+            </div>
+            <button
+              type="submit"
+              className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold transition"
+            >
+              {savedNotice ? (
+                <>
+                  <Check className="w-3.5 h-3.5" />
+                  <span>Saved</span>
+                </>
+              ) : (
+                <span>Save Key</span>
+              )}
+            </button>
+          </form>
+        </div>
+
         {/* AI Model & Engine Info */}
         <div
           className={`p-5 rounded-2xl border ${
@@ -103,11 +167,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   <p className={`text-xs font-semibold ${theme === 'light' ? 'text-slate-800' : 'text-slate-100'}`}>
                     SQL Analytical Engine
                   </p>
-                  <p className="text-[11px] text-slate-400">DuckDB (In-memory columnar execution)</p>
+                  <p className="text-[11px] text-slate-400">DuckDB (Sandboxed in-memory, 15s query timeout)</p>
                 </div>
               </div>
               <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-500 font-medium">
-                0-Latency
+                Hardened
               </span>
             </div>
 
@@ -118,7 +182,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   <p className={`text-xs font-semibold ${theme === 'light' ? 'text-slate-800' : 'text-slate-100'}`}>
                     FastAPI Backend
                   </p>
-                  <p className="text-[11px] text-slate-400">http://127.0.0.1:8000</p>
+                  <p className="text-[11px] text-slate-400">
+                    {process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}
+                  </p>
                 </div>
               </div>
               <span
